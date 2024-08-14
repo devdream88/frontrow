@@ -1,0 +1,160 @@
+#!/bin/bash
+
+# Set your DigitalOcean API token
+DO_TOKEN=""
+NEW_VPC_NAME="example-vpc-$(date +%s)"
+
+# Export the DigitalOcean token for doctl
+export DIGITALOCEAN_ACCESS_TOKEN="$DO_TOKEN"
+
+# Create the Terraform configuration files
+
+# provider.tf
+cat <<EOT > provider.tf
+terraform {
+  required_providers {
+    digitalocean = {
+      source  = "digitalocean/digitalocean"
+      version = "~> 2.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "digitalocean" {
+  token = var.do_token
+}
+EOT
+
+# variables.tf
+cat <<EOT > variables.tf
+variable "do_token" {
+  description = "DigitalOcean API token"
+  type        = string
+}
+
+variable "region" {
+  description = "DigitalOcean region"
+  type        = string
+  default     = "nyc3"
+}
+
+variable "ssh_key_name" {
+  description = "Name of the SSH key"
+  type        = string
+  default     = "openobserve-ssh-key"
+}
+EOT
+
+# vpc.tf
+cat <<EOT > vpc.tf
+resource "digitalocean_vpc" "default" {
+  name     = "${NEW_VPC_NAME}"
+  region   = var.region
+  ip_range = "10.10.10.0/24"
+}
+EOT
+
+# ssh_key.tf
+cat <<EOT > ssh_key.tf
+resource "tls_private_key" "ssh_key" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "digitalocean_ssh_key" "default" {
+  name       = var.ssh_key_name
+  public_key = tls_private_key.ssh_key.public_key_openssh
+}
+EOT
+
+# droplets.tf
+cat <<EOT > droplets.tf
+resource "digitalocean_droplet" "app" {
+  count    = 3
+  name     = "openobserve-app-\${count.index + 1}"
+  region   = var.region
+  size     = "s-1vcpu-1gb"
+  image    = "ubuntu-20-04-x64"
+  vpc_uuid = digitalocean_vpc.default.id
+  ssh_keys = [digitalocean_ssh_key.default.fingerprint]
+
+  connection {
+    type        = "ssh"
+    user        = "root"
+    private_key = tls_private_key.ssh_key.private_key_pem
+    host        = self.ipv4_address
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do echo 'Waiting for other package managers to finish...' && sleep 5; done",
+      "until sudo apt-get update -y; do echo 'Retrying apt-get update...'; sleep 2; done",
+      "until sudo apt-get install -y docker.io docker-compose; do echo 'Retrying apt-get install...'; sleep 2; done",
+      "mkdir -p /root/openobserve",
+      <<-EOF
+      cat <<'EOS' > /root/openobserve/docker-compose.yml
+      version: '3.3'
+      services:
+        openobserve:
+          image: public.ecr.aws/zinclabs/openobserve:latest
+          restart: unless-stopped
+          environment:
+            ZO_ROOT_USER_EMAIL: 'root@example.com'
+            ZO_ROOT_USER_PASSWORD: 'Complexpass#123'
+          ports:
+            - '5080:5080'
+      EOS
+      EOF
+      ,
+      "cd /root/openobserve && docker-compose up -d"
+    ]
+  }
+}
+EOT
+
+# loadbalancer.tf
+cat <<EOT > loadbalancer.tf
+resource "digitalocean_loadbalancer" "app_lb" {
+  name   = "openobserve-lb"
+  region = var.region
+  vpc_uuid = digitalocean_vpc.default.id
+  forwarding_rule {
+    entry_protocol  = "http"
+    entry_port      = 80
+    target_protocol = "http"
+    target_port     = 5080
+  }
+  healthcheck {
+    protocol               = "http"
+    port                   = 5080
+    path                   = "/"
+    check_interval_seconds = 10
+    response_timeout_seconds = 5
+    healthy_threshold      = 5
+    unhealthy_threshold    = 3
+  }
+  droplet_ids = digitalocean_droplet.app[*].id
+}
+EOT
+
+# outputs.tf
+cat <<EOT > outputs.tf
+output "droplet_ips" {
+  value = digitalocean_droplet.app[*].ipv4_address
+}
+
+output "load_balancer_ip" {
+  value = digitalocean_loadbalancer.app_lb.ip
+}
+EOT
+
+# Initialize Terraform
+terraform init
+
+# Apply Terraform to create the VPC, SSH key, droplets, and load balancer
+terraform apply -var "do_token=${DO_TOKEN}" -auto-approve
+
